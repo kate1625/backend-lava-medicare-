@@ -1,18 +1,14 @@
-# LavaLust Framework
+# MediCare+ Backend
 
-> A lightweight, fast PHP framework built for developers who want clean MVC architecture without unnecessary complexity or performance overhead.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![PHP Version](https://img.shields.io/badge/PHP-%3E%3D7.4-8892BF)](https://www.php.net/)
-[![GitHub Stars](https://img.shields.io/github/stars/ronmarasigan/lavalust?style=flat)](https://github.com/ronmarasigan/lavalust/stargazers)
+> REST API for the MediCare+ clinic management application, built on the LavaLust PHP framework.
 
 ---
 
 ## Overview
 
-**LavaLust** is an open-source PHP framework that follows the **MVC (Model–View–Controller)** architectural pattern. It is designed for developers who need a structured, maintainable, and scalable foundation — without the bloat of heavier modern frameworks.
+MediCare+ provides clinic, appointment, patient, payment, notification, and care-record APIs for the Vue frontend. The backend uses LavaLust's MVC architecture and MySQL.
 
-Whether you are building a simple web application, a REST API, or a teaching project, LavaLust provides the right tools with minimal friction.
+For Render deployment and required environment variables, see [RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md).
 
 ---
 

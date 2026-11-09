@@ -23,3 +23,9 @@
 <FilesMatch "^(\.env|composer\.(json|lock)|package\.json|package-lock\.json|\.git)">
     Require all denied
 </FilesMatch>
+
+<IfModule mod_headers.c>
+    <FilesMatch "\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf)$">
+        Header set Cache-Control "public, max-age=86400, must-revalidate"
+    </FilesMatch>
+</IfModule>

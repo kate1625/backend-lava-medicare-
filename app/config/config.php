@@ -65,6 +65,10 @@ $config['version']                 = '4.7.0';
 | Values: development and production
 */
 $config['environment'] = getenv('APP_ENV') ?: 'development';
+$corsOrigins = getenv('CORS_ALLOWED_ORIGINS');
+$corsOrigins = $corsOrigins
+    ? array_values(array_filter(array_map('trim', explode(',', $corsOrigins))))
+    : [];
 
 /*
 |--------------------------------------------------------------------------
@@ -88,7 +92,7 @@ $config['date_default_timezone'] = 'Asia/Manila';
 | WARNING: You MUST set this value!
 |
 */
-$config['base_url'] 				= '';
+$config['base_url'] 				= 'http://127.0.0.1:8080/';
 
 /*
 |--------------------------------------------------------------------------
@@ -399,7 +403,7 @@ $config['security_headers'] = [
     // ── API ──
     'api_max_body' => 1048576,
     'cors' => [
-        'allowed_origins' => [],
+        'allowed_origins' => $corsOrigins,
         'credentials'     => false,
         'methods'         => 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
         'headers'         => 'Authorization, Content-Type, X-Requested-With',

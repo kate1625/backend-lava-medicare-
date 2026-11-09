@@ -237,6 +237,15 @@ if ( ! function_exists('_error_handler'))
 		// Convert severity number to string name
 		$severity_name = $error_levels[$severity] ?? "UNKNOWN_ERROR";
 
+		// PHP notices and deprecations must not inject an HTML error page into
+		// JSON API responses. Log deprecations and let the request complete.
+		$request_path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?: '';
+		$is_api_request = str_starts_with($request_path, '/api/');
+		if ($is_api_request && in_array($severity, [E_DEPRECATED, E_USER_DEPRECATED], true)) {
+			error_log("{$severity_name}: {$errstr} in {$errfile}:{$errline}");
+			return true;
+		}
+
 		if (config_item('log_threshold') == 1 || config_item('log_threshold') == 3) {
 			$logger = load_class('logger', 'kernel');
 			$logger->log('error', $severity_name, $errstr, $errfile, $errline);

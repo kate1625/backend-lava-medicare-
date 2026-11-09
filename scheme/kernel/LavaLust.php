@@ -62,6 +62,9 @@ if (file_exists(ROOT_DIR . '.env')) {
             $value = substr($value, 1, -1);
         }
 
+        // Respect environment variables already set outside .env (e.g. local overrides)
+        if (getenv($key) !== false) continue;
+
         putenv("$key=$value");
         $_ENV[$key] = $_SERVER[$key] = $value;
     }

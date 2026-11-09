@@ -266,7 +266,34 @@ class Database {
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
+            PDO::ATTR_TIMEOUT            => 10,
         );
+
+        if ($driver === 'mysql' && (getenv('APP_ENV') ?: 'development') === 'development') {
+            $options[PDO::ATTR_PERSISTENT] = true;
+        }
+
+        $ssl_ca = $database_config['ssl_ca'] ?? '';
+        if ($driver === 'mysql' && $ssl_ca !== '') {
+            if (!preg_match('/^(?:[A-Za-z]:[\\\\\/]|[\\\\\/])/', $ssl_ca) && defined('ROOT_DIR')) {
+                $ssl_ca = ROOT_DIR . str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $ssl_ca);
+            }
+
+            if (!is_file($ssl_ca) || !is_readable($ssl_ca)) {
+                throw new PDOException('The configured MySQL SSL CA file is missing or unreadable.');
+            }
+
+            $mysqlClass = 'Pdo\\Mysql';
+            $sslCaOption = defined($mysqlClass . '::ATTR_SSL_CA')
+                ? constant($mysqlClass . '::ATTR_SSL_CA')
+                : constant('PDO::MYSQL_ATTR_SSL_CA');
+            $verifyServerOption = defined($mysqlClass . '::ATTR_SSL_VERIFY_SERVER_CERT')
+                ? constant($mysqlClass . '::ATTR_SSL_VERIFY_SERVER_CERT')
+                : constant('PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT');
+
+            $options[$sslCaOption] = $ssl_ca;
+            $options[$verifyServerOption] = true;
+        }
 
         try {
             $this->db = new PDO($dsn, $username, $password, $options);
@@ -1763,6 +1790,14 @@ class Database {
      */
     public function __destruct()
     {
+        if ($this->db instanceof PDO && $this->db->inTransaction()) {
+            try {
+                $this->db->rollBack();
+            } catch (PDOException $exception) {
+                error_log('Could not roll back a persistent database connection: ' . $exception->getMessage());
+            }
+        }
+
         $this->db = null;
     }
 }

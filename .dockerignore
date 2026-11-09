@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+runtime/cache/
+*.log
+database.sql
+database_seed.sql
+database_update_*.sql
+schema/medicare_plus_erd.sql
+bootstrap_local.php
+router_local.php
+console/create_admin.php
+console/create_demo_account.php
+console/migrate_legacy_local.php
+console/test_patient_crud.php

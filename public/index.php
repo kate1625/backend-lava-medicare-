@@ -1,5 +1,6 @@
 <?php
 define('PREVENT_DIRECT_ACCESS', TRUE);
+header('Cache-Control: private, no-store, max-age=0');
 /**
  * ------------------------------------------------------------------
  * LavaLust - an opensource lightweight PHP MVC Framework
