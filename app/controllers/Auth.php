@@ -54,6 +54,7 @@ class Auth extends Controller
 
         $database->raw('UPDATE users SET failed_login_attempts=0, locked_until=NULL, last_login=NOW() WHERE user_id=?', [(int) $user['user_id']]);
         $token = medicare_issue_token($database, (int) $user['user_id']);
+        $tokenTtl = medicare_access_token_ttl();
         medicare_audit($database, (int) $user['user_id'], 'LOGIN', 'users', (int) $user['user_id']);
         $api->respond([
             'user' => [
@@ -62,7 +63,7 @@ class Auth extends Controller
                 'email' => $user['email'],
                 'role' => strtolower($user['role_name']),
             ],
-            'tokens' => ['access_token' => $token, 'token_type' => 'Bearer', 'expires_in' => 900],
+            'tokens' => ['access_token' => $token, 'token_type' => 'Bearer', 'expires_in' => $tokenTtl],
         ]);
     }
 

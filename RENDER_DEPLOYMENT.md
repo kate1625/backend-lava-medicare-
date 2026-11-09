@@ -28,6 +28,7 @@ Use the database provider's connection values. Do not copy `.env` into GitHub.
 | `DB_SSL_VERIFY` | `true` |
 | `JWT_SECRET` | A new random value, at least 32 characters |
 | `REFRESH_TOKEN_KEY` | A different new random value, at least 32 characters |
+| `MEDICARE_ACCESS_TOKEN_TTL` | Optional. Session duration in seconds; default `28800` (8 hours), allowed range `300`-`43200` |
 | `FRONTEND_URL` | The deployed frontend origin, such as `https://your-site.onrender.com` |
 | `CORS_ALLOWED_ORIGINS` | The exact frontend origin; comma-separate additional trusted origins |
 

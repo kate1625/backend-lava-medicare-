@@ -42,11 +42,22 @@ function medicare_log_patient_email($database, int $appointmentId, int $patientI
     medicare_log_email($database, $appointmentId, $patientId, $type, $subject, $result, 'patient');
 }
 
+function medicare_access_token_ttl(): int
+{
+    $configuredTtl = filter_var(getenv('MEDICARE_ACCESS_TOKEN_TTL'), FILTER_VALIDATE_INT);
+    if ($configuredTtl === false || $configuredTtl < 300 || $configuredTtl > 43200) {
+        return 28800;
+    }
+
+    return $configuredTtl;
+}
+
 function medicare_issue_token($database, int $userId): string
 {
     $token = bin2hex(random_bytes(32));
+    $expiresIn = medicare_access_token_ttl();
     $database->raw(
-        'INSERT INTO auth_tokens (user_id, token, expires_at, is_revoked) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), ?)',
+        'INSERT INTO auth_tokens (user_id, token, expires_at, is_revoked) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ' . $expiresIn . ' SECOND), ?)',
         [$userId, hash('sha256', $token), 0]
     );
     return $token;
