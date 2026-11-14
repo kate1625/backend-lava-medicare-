@@ -4,6 +4,10 @@ require_once APP_DIR . 'helpers/medicare_auth_helper.php';
 
 class Appointments extends Controller
 {
+    private const SLOT_INTERVAL_MINUTES = 40;
+    private const LUNCH_START = '12:00:00';
+    private const LUNCH_END = '13:00:00';
+
     private function api() { return $this->call->library('api'); }
     private function database() { return $this->call->database(); }
 
@@ -118,6 +122,13 @@ class Appointments extends Controller
         return $date > date('Y-m-d') || ($date === date('Y-m-d') && $time > date('H:i:s'));
     }
 
+    private function overlapsLunchBreak(DateTimeImmutable $start, DateTimeImmutable $end): bool
+    {
+        $lunchStart = new DateTimeImmutable($start->format('Y-m-d') . ' ' . self::LUNCH_START);
+        $lunchEnd = new DateTimeImmutable($start->format('Y-m-d') . ' ' . self::LUNCH_END);
+        return $start < $lunchEnd && $end > $lunchStart;
+    }
+
     private function appointmentRows($database, array $user): array
     {
         $base = "SELECT a.appointment_id, a.patient_id, a.service_id, a.dentist_id, a.appt_date, a.appt_time, a.end_time, a.status, a.remarks, a.cancel_reason, a.reschedule_reason, a.created_at, CONCAT(pt.first_name, ' ', pt.last_name) AS patient, pt.email AS patient_email, s.service_name, s.price, CONCAT(du.username) AS dentist, "
@@ -138,24 +149,100 @@ class Appointments extends Controller
         return $statement->fetchAll(PDO::FETCH_ASSOC);
     }
 
-    private function slotIsAvailable($database, int $dentistId, string $date, string $start, int $duration, int $excludeAppointmentId = 0): bool
+    private function schedulesForDate($database, int $dentistId, string $date, bool $forUpdate = false): array
     {
         $day = (int) (new DateTimeImmutable($date))->format('w');
-        $end = (new DateTimeImmutable($date . ' ' . $start))->modify('+' . $duration . ' minutes')->format('H:i:s');
-        $schedule = $database->raw(
-            "SELECT ds.schedule_id FROM dentist_schedules ds
-             WHERE ds.dentist_id=? AND ds.day_of_week=? AND ds.start_time<=? AND ds.end_time>=?
-               AND NOT EXISTS (
-                   SELECT 1 FROM appointments a JOIN services s ON s.service_id=a.service_id
-                   WHERE a.dentist_id=ds.dentist_id AND a.appt_date=?
-                     AND a.status NOT IN ('cancelled','no_show') AND a.appointment_id<>?
-                     AND a.appt_time<?
-                     AND COALESCE(a.end_time, ADDTIME(a.appt_time, SEC_TO_TIME(GREATEST(s.duration_min,15) * 60)))>?
-               )
+        $lock = $forUpdate ? ' FOR UPDATE' : '';
+        $overrides = $database->raw(
+            'SELECT start_time, end_time, is_available FROM dentist_schedules WHERE dentist_id=? AND schedule_date=? ORDER BY start_time' . $lock,
+            [$dentistId, $date]
+        )->fetchAll(PDO::FETCH_ASSOC);
+        if ($overrides) {
+            return (bool) $overrides[0]['is_available'] ? $overrides : [];
+        }
+
+        return $database->raw(
+            'SELECT start_time, end_time, is_available FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? AND schedule_date IS NULL AND is_available=1 ORDER BY start_time' . $lock,
+            [$dentistId, $day]
+        )->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    private function lockSchedulesForDate($database, int $dentistId, string $date): void
+    {
+        $day = (int) (new DateTimeImmutable($date))->format('w');
+        $database->raw(
+            'SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND ((schedule_date IS NULL AND day_of_week=?) OR schedule_date=?) FOR UPDATE',
+            [$dentistId, $day, $date]
+        )->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    private function timeSlotsForDate(string $date, array $schedules, array $booked, int $duration): array
+    {
+        $timeSlots = [];
+        foreach ($schedules as $schedule) {
+            $start = new DateTimeImmutable($date . ' ' . $schedule['start_time']);
+            $close = new DateTimeImmutable($date . ' ' . $schedule['end_time']);
+            while ($start->modify('+' . $duration . ' minutes') <= $close) {
+                $end = $start->modify('+' . $duration . ' minutes');
+                if ($this->overlapsLunchBreak($start, $end)) {
+                    $start = $start->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
+                    continue;
+                }
+                $busy = false;
+                foreach ($booked as $appointment) {
+                    if (isset($appointment['appt_date']) && $appointment['appt_date'] !== $date) continue;
+                    $bookedStart = new DateTimeImmutable($date . ' ' . $appointment['appt_time']);
+                    $bookedEnd = new DateTimeImmutable($date . ' ' . ($appointment['end_time'] ?: $appointment['appt_time']));
+                    if ($start < $bookedEnd && $end > $bookedStart) {
+                        $busy = true;
+                        break;
+                    }
+                }
+
+                $time = $start->format('H:i');
+                $status = $busy ? 'booked' : ($this->slotIsInFuture($date, $start->format('H:i:s')) ? 'available' : 'past');
+                $timeSlots[$time] = ['time' => $time, 'status' => $status];
+                $start = $start->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
+            }
+        }
+
+        return array_values($timeSlots);
+    }
+
+    private function slotIsAvailable($database, int $dentistId, string $date, string $start, int $duration, int $excludeAppointmentId = 0): bool
+    {
+        $startAt = new DateTimeImmutable($date . ' ' . $start);
+        $endAt = $startAt->modify('+' . $duration . ' minutes');
+        $insideSchedule = false;
+        foreach ($this->schedulesForDate($database, $dentistId, $date, true) as $schedule) {
+            $scheduleStart = new DateTimeImmutable($date . ' ' . $schedule['start_time']);
+            $scheduleEnd = new DateTimeImmutable($date . ' ' . $schedule['end_time']);
+            for ($slot = $scheduleStart; $slot <= $startAt; $slot = $slot->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes')) {
+                if ($slot == $startAt) {
+                    if ($endAt <= $scheduleEnd && !$this->overlapsLunchBreak($startAt, $endAt)) {
+                        $insideSchedule = true;
+                        break 2;
+                    }
+                    break;
+                }
+            }
+        }
+        if (!$insideSchedule) {
+            return false;
+        }
+
+        $conflict = $database->raw(
+            "SELECT a.appointment_id FROM appointments a
+             JOIN services s ON s.service_id=a.service_id
+             WHERE a.dentist_id=? AND a.appt_date=?
+               AND a.status NOT IN ('cancelled','no_show') AND a.appointment_id<>?
+               AND a.appt_time<?
+               AND COALESCE(a.end_time, ADDTIME(a.appt_time, SEC_TO_TIME(GREATEST(s.duration_min,15) * 60)))>?
              LIMIT 1 FOR UPDATE",
-            [$dentistId, $day, $start, $end, $date, $excludeAppointmentId, $end, $start]
+            [$dentistId, $date, $excludeAppointmentId, $endAt->format('H:i:s'), $startAt->format('H:i:s')]
         )->fetch(PDO::FETCH_ASSOC);
-        return (bool) $schedule;
+
+        return !$conflict;
     }
 
     public function availability()
@@ -173,32 +260,13 @@ class Appointments extends Controller
         $dentist = $database->raw("SELECT d.dentist_id FROM dentists d JOIN users u ON u.user_id=d.user_id WHERE d.dentist_id=? AND u.status='active' LIMIT 1", [$dentistId])->fetch(PDO::FETCH_ASSOC);
         if (!$dentist) $api->respond_error('Dentist not found or inactive.', 404);
         $duration = max(15, (int) $service['duration_min']);
-        $day = (int) (new DateTimeImmutable($date))->format('w');
-        $schedules = $database->raw('SELECT start_time, end_time FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? ORDER BY start_time', [$dentistId, $day])->fetchAll(PDO::FETCH_ASSOC);
+        $schedules = $this->schedulesForDate($database, $dentistId, $date);
         $booked = $database->raw("SELECT a.appt_time, COALESCE(a.end_time, ADDTIME(a.appt_time, SEC_TO_TIME(GREATEST(s.duration_min,15) * 60))) AS end_time FROM appointments a JOIN services s ON s.service_id=a.service_id WHERE a.dentist_id=? AND a.appt_date=? AND a.status NOT IN ('cancelled','no_show')", [$dentistId, $date])->fetchAll(PDO::FETCH_ASSOC);
-        $slots = [];
-        $timeSlots = [];
-        foreach ($schedules as $schedule) {
-            $start = new DateTimeImmutable($date . ' ' . $schedule['start_time']);
-            $close = new DateTimeImmutable($date . ' ' . $schedule['end_time']);
-            while ($start->modify('+' . $duration . ' minutes') <= $close) {
-                $end = $start->modify('+' . $duration . ' minutes');
-                $busy = false;
-                foreach ($booked as $appointment) {
-                    $bookedStart = new DateTimeImmutable($date . ' ' . $appointment['appt_time']);
-                    $bookedEnd = new DateTimeImmutable($date . ' ' . ($appointment['end_time'] ?: $appointment['appt_time']));
-                    if ($start < $bookedEnd && $end > $bookedStart) { $busy = true; break; }
-                }
-                $time = $start->format('H:i');
-                $status = $busy ? 'booked' : ($this->slotIsInFuture($date, $start->format('H:i:s')) ? 'available' : 'past');
-                $timeSlots[] = ['time' => $time, 'status' => $status];
-                if ($status === 'available') $slots[] = $time;
-                $start = $start->modify('+15 minutes');
-            }
-        }
-        $uniqueTimeSlots = [];
-        foreach ($timeSlots as $timeSlot) $uniqueTimeSlots[$timeSlot['time']] = $timeSlot;
-        $api->respond(['data' => ['date' => $date, 'duration_min' => $duration, 'slots' => array_values(array_unique($slots)), 'time_slots' => array_values($uniqueTimeSlots)]]);
+        $timeSlots = $this->timeSlotsForDate($date, $schedules, $booked, $duration);
+        $slots = array_column(array_filter($timeSlots, static function (array $slot): bool {
+            return $slot['status'] === 'available';
+        }), 'time');
+        $api->respond(['data' => ['date' => $date, 'duration_min' => $duration, 'slots' => $slots, 'time_slots' => $timeSlots]]);
     }
 
     public function calendar()
@@ -220,11 +288,17 @@ class Appointments extends Controller
         if (!$service) $api->respond_error('Service not found or inactive.', 404);
         $dentist = $database->raw("SELECT dentist_id FROM dentists d JOIN users u ON u.user_id=d.user_id WHERE d.dentist_id=? AND u.status='active' LIMIT 1", [$dentistId])->fetch(PDO::FETCH_ASSOC);
         if (!$dentist) $api->respond_error('Dentist not found or inactive.', 404);
-        $schedules = $database->raw('SELECT day_of_week, start_time, end_time FROM dentist_schedules WHERE dentist_id=? ORDER BY day_of_week, start_time', [$dentistId])->fetchAll(PDO::FETCH_ASSOC);
+        $schedules = $database->raw('SELECT day_of_week, start_time, end_time, is_available FROM dentist_schedules WHERE dentist_id=? AND schedule_date IS NULL ORDER BY day_of_week, start_time', [$dentistId])->fetchAll(PDO::FETCH_ASSOC);
+        $scheduleOverrides = $database->raw('SELECT schedule_date, start_time, end_time, is_available FROM dentist_schedules WHERE dentist_id=? AND schedule_date>=? AND schedule_date<? ORDER BY schedule_date, start_time', [$dentistId, $startText, $endText])->fetchAll(PDO::FETCH_ASSOC);
+        $overridesByDate = [];
+        foreach ($scheduleOverrides as $schedule) {
+            $overridesByDate[$schedule['schedule_date']][] = $schedule;
+        }
         $booked = $database->raw("SELECT a.appt_date, a.appt_time, COALESCE(a.end_time, ADDTIME(a.appt_time, SEC_TO_TIME(GREATEST(s.duration_min,15) * 60))) AS end_time FROM appointments a JOIN services s ON s.service_id=a.service_id WHERE a.dentist_id=? AND a.appt_date>=? AND a.appt_date<? AND a.status NOT IN ('cancelled','no_show')", [$dentistId, $startText, $endText])->fetchAll(PDO::FETCH_ASSOC);
         $events = [];
         $duration = max(15, (int) $service['duration_min']);
         for ($date = $startDate; $date < $endDate; $date = $date->modify('+1 day')) {
+            $dateText = $date->format('Y-m-d');
             $day = (int) $date->format('w');
             foreach ($booked as $appointment) {
                 if ($appointment['appt_date'] !== $date->format('Y-m-d')) continue;
@@ -242,29 +316,34 @@ class Appointments extends Controller
                     'extendedProps' => ['appt_date' => $date->format('Y-m-d'), 'appt_time' => $appointment['appt_time'], 'slot_status' => 'booked'],
                 ];
             }
-            foreach ($schedules as $schedule) {
-                if ((int) $schedule['day_of_week'] !== $day) continue;
-                $slot = new DateTimeImmutable($date->format('Y-m-d') . ' ' . $schedule['start_time']);
-                $close = new DateTimeImmutable($date->format('Y-m-d') . ' ' . $schedule['end_time']);
-                while ($slot->modify('+' . $duration . ' minutes') <= $close) {
-                    $slotEnd = $slot->modify('+' . $duration . ' minutes');
-                    $busy = false;
-                    foreach ($booked as $appointment) {
-                        if ($appointment['appt_date'] !== $date->format('Y-m-d')) continue;
-                        $bookedStart = new DateTimeImmutable($date->format('Y-m-d') . ' ' . $appointment['appt_time']);
-                        $bookedEnd = new DateTimeImmutable($date->format('Y-m-d') . ' ' . ($appointment['end_time'] ?: $appointment['appt_time']));
-                        if ($slot < $bookedEnd && $slotEnd > $bookedStart) { $busy = true; break; }
-                    }
-                    if ($busy) {
-                        $slot = $slot->modify('+15 minutes');
-                        continue;
-                    }
-                    if ($this->slotIsInFuture($date->format('Y-m-d'), $slot->format('H:i:s'))) {
-                        $events[] = ['id' => $slot->format('Y-m-d-H-i'), 'title' => $slot->format('H:i') . ' Available', 'start' => $slot->format('Y-m-d\TH:i:s'), 'end' => $slotEnd->format('Y-m-d\TH:i:s'), 'display' => 'block', 'backgroundColor' => '#dff3e8', 'borderColor' => '#acd9be', 'textColor' => '#26784e', 'extendedProps' => ['appt_date' => $date->format('Y-m-d'), 'appt_time' => $slot->format('H:i'), 'slot_status' => 'available']];
-                    } else {
-                        $events[] = ['id' => 'past-' . $slot->format('Y-m-d-H-i'), 'title' => 'Time has passed', 'start' => $slot->format('Y-m-d\TH:i:s'), 'end' => $slotEnd->format('Y-m-d\TH:i:s'), 'display' => 'block', 'backgroundColor' => '#eef0f2', 'borderColor' => '#d7dce0', 'textColor' => '#7d8790', 'extendedProps' => ['appt_date' => $date->format('Y-m-d'), 'appt_time' => $slot->format('H:i'), 'slot_status' => 'past']];
-                    }
-                    $slot = $slot->modify('+15 minutes');
+            if (array_key_exists($dateText, $overridesByDate)) {
+                $dateSchedules = (bool) $overridesByDate[$dateText][0]['is_available'] ? $overridesByDate[$dateText] : [];
+            } else {
+                $dateSchedules = array_values(array_filter($schedules, static function (array $schedule) use ($day): bool {
+                    return (int) $schedule['day_of_week'] === $day && (bool) $schedule['is_available'];
+                }));
+            }
+            $dateSlots = $this->timeSlotsForDate($dateText, $dateSchedules, $booked, $duration);
+            if ($dateSchedules) {
+                $availableCount = count(array_filter($dateSlots, static function (array $slot): bool {
+                    return $slot['status'] === 'available';
+                }));
+                $events[] = [
+                    'id' => 'availability-' . $dateText,
+                    'title' => $availableCount . ' available',
+                    'start' => $dateText . 'T00:00:00',
+                    'display' => 'none',
+                    'extendedProps' => ['appt_date' => $dateText, 'slot_status' => 'summary', 'available_count' => $availableCount],
+                ];
+            }
+            foreach ($dateSlots as $slot) {
+                if ($slot['status'] === 'booked') continue;
+                $slotStart = new DateTimeImmutable($dateText . ' ' . $slot['time']);
+                $slotEnd = $slotStart->modify('+' . $duration . ' minutes');
+                if ($slot['status'] === 'available') {
+                    $events[] = ['id' => $slotStart->format('Y-m-d-H-i'), 'title' => $slot['time'] . ' Available', 'start' => $slotStart->format('Y-m-d\TH:i:s'), 'end' => $slotEnd->format('Y-m-d\TH:i:s'), 'display' => 'block', 'backgroundColor' => '#dff3e8', 'borderColor' => '#acd9be', 'textColor' => '#26784e', 'extendedProps' => ['appt_date' => $dateText, 'appt_time' => $slot['time'], 'slot_status' => 'available']];
+                } else {
+                    $events[] = ['id' => 'past-' . $slotStart->format('Y-m-d-H-i'), 'title' => 'Time has passed', 'start' => $slotStart->format('Y-m-d\TH:i:s'), 'end' => $slotEnd->format('Y-m-d\TH:i:s'), 'display' => 'block', 'backgroundColor' => '#eef0f2', 'borderColor' => '#d7dce0', 'textColor' => '#7d8790', 'extendedProps' => ['appt_date' => $dateText, 'appt_time' => $slot['time'], 'slot_status' => 'past']];
                 }
             }
         }
@@ -333,6 +412,9 @@ class Appointments extends Controller
         $api = $this->api();
         $database = $this->database();
         $user = medicare_require_role($database, $api, ['Patient', 'Staff', 'Admin']);
+        if ($user['role_name'] === 'Patient' && !(int) $user['is_verified']) {
+            $api->respond_error('Verify your email address in Profile & Settings before booking an appointment.', 403);
+        }
         $body = $api->body();
         $serviceId = filter_var($body['service_id'] ?? null, FILTER_VALIDATE_INT);
         $dentistId = filter_var($body['dentist_id'] ?? null, FILTER_VALIDATE_INT);
@@ -367,7 +449,7 @@ class Appointments extends Controller
         if (!$this->slotIsInFuture($date, $time)) $api->respond_error('Choose a time that has not already passed.', 422);
 
         $database->transaction();
-        $database->raw('SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? FOR UPDATE', [$dentistId, (int) (new DateTimeImmutable($date))->format('w')])->fetchAll(PDO::FETCH_ASSOC);
+        $this->lockSchedulesForDate($database, $dentistId, $date);
         if (!$this->slotIsAvailable($database, $dentistId, $date, $time, $duration)) {
             $database->roll_back();
             $api->respond_error('That appointment slot is no longer available.', 409);
@@ -513,7 +595,7 @@ class Appointments extends Controller
         if (!$appointment['dentist_id'] || !in_array($appointment['status'], ['pending','confirmed'], true)) { $database->roll_back(); $api->respond_error('This appointment cannot be rescheduled.', 409); }
         $service = $database->raw('SELECT duration_min FROM services WHERE service_id=?', [(int) $appointment['service_id']])->fetch(PDO::FETCH_ASSOC);
         $duration = max(15, (int) ($service['duration_min'] ?? 30));
-        $database->raw('SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? FOR UPDATE', [(int) $appointment['dentist_id'], (int) (new DateTimeImmutable($date))->format('w')])->fetchAll(PDO::FETCH_ASSOC);
+        $this->lockSchedulesForDate($database, (int) $appointment['dentist_id'], $date);
         if (!$this->slotIsAvailable($database, (int) $appointment['dentist_id'], $date, $time, $duration, $id)) {
             $database->roll_back();
             $api->respond_error('That appointment slot is no longer available.', 409);

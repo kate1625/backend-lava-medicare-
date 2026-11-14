@@ -75,7 +75,7 @@ function medicare_authenticate($database, $api): array
     }
 
     $statement = $database->raw(
-        'SELECT u.user_id, u.username, u.email, u.status, r.role_name FROM auth_tokens t JOIN users u ON u.user_id=t.user_id JOIN roles r ON r.role_id=u.role_id WHERE t.token=? AND t.is_revoked=0 AND t.expires_at>NOW() LIMIT 1',
+        'SELECT u.user_id, u.username, u.email, u.status, u.is_verified, r.role_name FROM auth_tokens t JOIN users u ON u.user_id=t.user_id JOIN roles r ON r.role_id=u.role_id WHERE t.token=? AND t.is_revoked=0 AND t.expires_at>NOW() LIMIT 1',
         [hash('sha256', $matches[1])]
     );
     $user = $statement->fetch(PDO::FETCH_ASSOC);

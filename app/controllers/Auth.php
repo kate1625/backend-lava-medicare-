@@ -47,7 +47,7 @@ class Auth extends Controller
             medicare_audit($database, (int) $user['user_id'], 'LOGIN_FAILED', 'users', (int) $user['user_id']);
             $api->respond_error('Invalid username/email or password.', 401);
         }
-        if (!(int) $user['is_verified']) {
+        if (!(int) $user['is_verified'] && $user['role_name'] !== 'Patient') {
             medicare_audit($database, (int) $user['user_id'], 'LOGIN_UNVERIFIED', 'users', (int) $user['user_id']);
             $api->respond_error('Verify your email address before signing in.', 403);
         }
@@ -55,16 +55,32 @@ class Auth extends Controller
         $database->raw('UPDATE users SET failed_login_attempts=0, locked_until=NULL, last_login=NOW() WHERE user_id=?', [(int) $user['user_id']]);
         $token = medicare_issue_token($database, (int) $user['user_id']);
         $tokenTtl = medicare_access_token_ttl();
-        medicare_audit($database, (int) $user['user_id'], 'LOGIN', 'users', (int) $user['user_id']);
+        medicare_audit($database, (int) $user['user_id'], (int) $user['is_verified'] ? 'LOGIN' : 'LOGIN_UNVERIFIED', 'users', (int) $user['user_id']);
         $api->respond([
             'user' => [
                 'id' => (int) $user['user_id'],
                 'username' => $user['username'],
                 'email' => $user['email'],
                 'role' => strtolower($user['role_name']),
+                'is_verified' => (bool) $user['is_verified'],
             ],
             'tokens' => ['access_token' => $token, 'token_type' => 'Bearer', 'expires_in' => $tokenTtl],
         ]);
+    }
+
+    public function account()
+    {
+        $api = $this->call->library('api');
+        $api->require_method('GET');
+        $database = $this->call->database();
+        $user = medicare_authenticate($database, $api);
+        $api->respond(['data' => [
+            'id' => (int) $user['user_id'],
+            'username' => $user['username'],
+            'email' => $user['email'],
+            'role' => strtolower($user['role_name']),
+            'is_verified' => (bool) $user['is_verified'],
+        ]]);
     }
 
     public function logout()
@@ -267,7 +283,7 @@ class Auth extends Controller
         $db->raw('UPDATE email_verifications SET is_used=1 WHERE verification_id=?', [(int) $row['verification_id']]);
         $db->raw('UPDATE users SET is_verified=1 WHERE user_id=?', [(int) $row['user_id']]);
         medicare_audit($db, (int) $row['user_id'], 'VERIFY_EMAIL', 'users', (int) $row['user_id']);
-        $api->respond(['message' => 'Email verified. You can now sign in.']);
+        $api->respond(['message' => 'Email verified successfully. Your account is ready to book appointments.']);
     }
 
     public function resendVerificationEmail()

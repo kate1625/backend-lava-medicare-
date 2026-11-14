@@ -55,7 +55,7 @@ class Workspace extends Controller
         [$api,$db,$user]=$this->ctx(['Staff','Admin','Patient']); $uid=(int)$user['user_id'];
         if($_SERVER['REQUEST_METHOD']==='GET'){
             $rows=$db->raw('SELECT m.message_id,m.sender_id,m.recipient_id,m.body,m.is_read,m.created_at,s.username sender,r.username recipient FROM clinic_messages m JOIN users s ON s.user_id=m.sender_id JOIN users r ON r.user_id=m.recipient_id WHERE m.sender_id=? OR m.recipient_id=? ORDER BY m.created_at DESC LIMIT 300',[$uid,$uid])->fetchAll(PDO::FETCH_ASSOC);
-            $contactSql="SELECT user_id,username,role_name FROM users JOIN roles USING(role_id) WHERE user_id<>? AND status='active'";
+            $contactSql="SELECT user_id,username,role_name,CASE WHEN last_seen_at >= DATE_SUB(NOW(), INTERVAL 75 SECOND) THEN 1 ELSE 0 END AS is_online FROM users JOIN roles USING(role_id) WHERE user_id<>? AND status='active'";
             if($user['role_name']==='Patient')$contactSql.=" AND role_name IN ('Staff','Admin')";
             $contacts=$db->raw($contactSql.' ORDER BY username',[$uid])->fetchAll(PDO::FETCH_ASSOC); $api->respond(['data'=>['messages'=>$rows,'contacts'=>$contacts]]);
         }
@@ -80,6 +80,7 @@ class Workspace extends Controller
     {
         [$api,$db,$user]=$this->ctx(['Staff','Admin','Patient']);
         $userId=(int)$user['user_id'];
+        $db->raw('UPDATE users SET last_seen_at=NOW() WHERE user_id=?',[$userId]);
         $counts=$db->raw(
             'SELECT (SELECT COUNT(*) FROM clinic_messages WHERE recipient_id=? AND is_read=0) AS messages, '
             . '(SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0) AS notifications',

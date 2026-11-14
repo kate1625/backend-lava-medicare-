@@ -47,6 +47,7 @@ defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
 $router->get('/', 'Welcome::index');
 $router->post('/api/auth/login', 'Auth::login');
 $router->post('/api/auth/logout', 'Auth::logout');
+$router->get('/api/auth/account', 'Auth::account');
 $router->post('/api/auth/register', 'Auth::register');
 $router->post('/api/auth/verify-email', 'Auth::verifyEmail');
 $router->post('/api/auth/resend-verification', 'Auth::resendVerificationEmail');
