@@ -516,7 +516,8 @@ class Clinic_operations extends Controller
         $paymentId = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
         $db->commit();
 
-        $returnUrl = $frontendUrl . '/patient/payment?paymongo=return&payment_id=' . $paymentId;
+        $returnUrl = $frontendUrl . '/patient/receipt?paymongo=return&id=' . $paymentId;
+        $cancelUrl = $frontendUrl . '/patient/payment?paymongo=return&payment_id=' . $paymentId;
         $payload = [
             'data' => [
                 'attributes' => [
@@ -529,7 +530,7 @@ class Clinic_operations extends Controller
                     'payment_method_types' => $types,
                     'description' => 'MediCare+ appointment #' . $appointmentId,
                     'success_url' => $returnUrl . '&result=success',
-                    'cancel_url' => $returnUrl . '&result=cancel',
+                    'cancel_url' => $cancelUrl . '&result=cancel',
                     'metadata' => [
                         'medicare_payment_id' => (string) $paymentId,
                         'medicare_appointment_id' => (string) $appointmentId,
@@ -558,9 +559,8 @@ class Clinic_operations extends Controller
     {
         $api = $this->api(); $api->require_method('POST'); $db = $this->db(); $user = medicare_require_role($db, $api, ['Patient', 'Staff', 'Admin']); $body = $api->body();
         $paymentId = filter_var($body['payment_id'] ?? null, FILTER_VALIDATE_INT);
-        $verify = !empty($body['verify']);
+        $verify = !empty($body['verify']) || $user['role_name'] === 'Patient';
         if (!$paymentId) $api->respond_error('A valid payment ID is required.', 422);
-        if ($verify && $user['role_name'] === 'Patient') $api->respond_error('Only clinic staff can verify a completed PayMongo test payment.', 403);
 
         if ($user['role_name'] === 'Patient') {
             $payment = $db->raw("SELECT p.payment_id, p.status, p.transaction_id FROM payments p JOIN appointments a ON a.appointment_id=p.appointment_id JOIN patients pt ON pt.patient_id=a.patient_id WHERE p.payment_id=? AND pt.user_id=?", [$paymentId, (int) $user['user_id']])->fetch(PDO::FETCH_ASSOC);
@@ -627,7 +627,7 @@ class Clinic_operations extends Controller
             );
             $email = $this->notifyPaymentVerified($paymentDetails, $db);
             $this->notifyAdminPaymentEmail($db, (int) $paymentId, 'verified');
-            $api->respond(['data' => ['status' => 'verified', 'email_sent' => $email['sent']], 'message' => $email['sent'] ? 'PayMongo test payment verified. Confirmation email sent.' : 'PayMongo test payment verified, but the confirmation email could not be sent.']);
+            $api->respond(['data' => ['status' => 'verified', 'email_sent' => $email['sent']], 'message' => $email['sent'] ? 'PayMongo payment confirmed. Your receipt is ready, and a confirmation email was sent.' : 'PayMongo payment confirmed. Your receipt is ready, but the confirmation email could not be sent.']);
         }
         if ($status === 'expired') {
             $db->transaction();
