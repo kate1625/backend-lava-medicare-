@@ -52,7 +52,7 @@ class Patient_portal extends Controller
         $api = $this->call->library('api');
         [$database, $user, $patient] = $this->context($api);
         $history = $database->raw(
-            'SELECT tr.record_id, tr.tooth_no, tr.diagnosis, tr.treatment_done, tr.notes, tr.created_at, u.username AS dentist FROM treatment_records tr LEFT JOIN dentists d ON d.dentist_id=tr.dentist_id LEFT JOIN users u ON u.user_id=d.user_id WHERE tr.patient_id=? ORDER BY tr.created_at DESC LIMIT 100',
+            'SELECT tr.record_id, tr.tooth_no, tr.diagnosis, tr.treatment_done, tr.notes, tr.follow_up_date, tr.follow_up_time, tr.created_at, u.username AS dentist FROM treatment_records tr LEFT JOIN dentists d ON d.dentist_id=tr.dentist_id LEFT JOIN users u ON u.user_id=d.user_id WHERE tr.patient_id=? ORDER BY tr.created_at DESC LIMIT 100',
             [(int) $patient['patient_id']]
         )->fetchAll(PDO::FETCH_ASSOC);
         $toothChart = $database->raw(
@@ -60,6 +60,17 @@ class Patient_portal extends Controller
             [(int) $patient['patient_id']]
         )->fetchAll(PDO::FETCH_ASSOC);
         $api->respond(['data' => ['profile' => $patient, 'treatment_history' => $history, 'tooth_chart' => $toothChart]]);
+    }
+
+    public function returnVisits()
+    {
+        $api = $this->call->library('api');
+        [$database, $user, $patient] = $this->context($api);
+        $visits = $database->raw(
+            "SELECT tr.record_id, tr.follow_up_date, tr.follow_up_time, tr.diagnosis, tr.treatment_done, u.username AS dentist FROM treatment_records tr LEFT JOIN dentists d ON d.dentist_id=tr.dentist_id LEFT JOIN users u ON u.user_id=d.user_id WHERE tr.patient_id=? AND tr.follow_up_date>=CURDATE() ORDER BY tr.follow_up_date, tr.follow_up_time, tr.record_id LIMIT 200",
+            [(int) $patient['patient_id']]
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $api->respond(['data' => $visits]);
     }
 
     public function updateProfile()

@@ -70,6 +70,7 @@ $router->get('/api/patients/{id}/tooth-chart', 'Workspace::toothChart')->where_n
 $router->put('/api/patients/{id}/tooth-chart', 'Workspace::toothChart')->where_number('id');
 $router->get('/api/patient/dashboard', 'Patient_portal::dashboard');
 $router->get('/api/patient/profile', 'Patient_portal::profile');
+$router->get('/api/patient/return-visits', 'Patient_portal::returnVisits');
 $router->put('/api/patient/profile', 'Patient_portal::updateProfile');
 $router->get('/api/patient/notifications', 'Patient_portal::notifications');
 $router->get('/api/notifications', 'Notifications::index');

@@ -275,6 +275,53 @@ class Clinic_operations extends Controller
         return $decoded['data'];
     }
 
+    private function paymongoFrontendUrl(): string
+    {
+        $configuredUrl = rtrim(trim((string) getenv('FRONTEND_URL')), '/');
+        $appEnvironment = strtolower(trim((string) getenv('APP_ENV')));
+        $isLocalDevelopment = in_array($appEnvironment, ['development', 'dev', 'local', 'testing'], true);
+        $requiresHttps = !$isLocalDevelopment;
+        $configuredParts = $configuredUrl !== '' ? parse_url($configuredUrl) : false;
+        $configuredHost = strtolower((string) ($configuredParts['host'] ?? ''));
+        $configuredIsLocal = in_array($configuredHost, ['localhost', '127.0.0.1', '::1', '[::1]'], true);
+
+        if ($configuredUrl !== '' && !($requiresHttps && $configuredIsLocal)) {
+            $scheme = strtolower((string) ($configuredParts['scheme'] ?? ''));
+            if (!is_array($configuredParts) || !in_array($scheme, ['http', 'https'], true) || !$configuredHost || isset($configuredParts['user']) || isset($configuredParts['pass']) || isset($configuredParts['query']) || isset($configuredParts['fragment'])) {
+                throw new RuntimeException('FRONTEND_URL must be an absolute HTTP or HTTPS frontend URL.');
+            }
+            if ($requiresHttps && $scheme !== 'https') {
+                throw new RuntimeException('FRONTEND_URL must use HTTPS outside local development.');
+            }
+            return $configuredUrl;
+        }
+
+        $requestOrigin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
+        $allowedOrigins = array_values(array_filter(array_map('trim', explode(',', (string) getenv('CORS_ALLOWED_ORIGINS')))));
+        $originParts = parse_url($requestOrigin);
+        $originIsValid = is_array($originParts)
+            && in_array(strtolower((string) ($originParts['scheme'] ?? '')), ['http', 'https'], true)
+            && !empty($originParts['host'])
+            && !isset($originParts['user'])
+            && !isset($originParts['pass'])
+            && !isset($originParts['path'])
+            && !isset($originParts['query'])
+            && !isset($originParts['fragment']);
+
+        if ($originIsValid && in_array($requestOrigin, $allowedOrigins, true)) {
+            if ($requiresHttps && strtolower((string) $originParts['scheme']) !== 'https') {
+                throw new RuntimeException('The allowed PayMongo return origin must use HTTPS outside local development.');
+            }
+            return $requestOrigin;
+        }
+
+        if (!$isLocalDevelopment) {
+            throw new RuntimeException('Configure FRONTEND_URL with the deployed frontend URL and allow that exact origin in CORS_ALLOWED_ORIGINS.');
+        }
+
+        return $configuredUrl !== '' ? $configuredUrl : 'http://localhost:5174';
+    }
+
     private function paymongoPaymentTypes()
     {
         $configured = trim((string) getenv('PAYMONGO_PAYMENT_METHOD_TYPES'));
@@ -443,6 +490,12 @@ class Clinic_operations extends Controller
         $method = $db->raw("SELECT payment_method_id FROM payment_methods WHERE payment_method_id=? AND is_active=1 AND type IN ('ewallet','card')", [$methodId])->fetch(PDO::FETCH_ASSOC);
         if (!$method) $api->respond_error('Choose an active card or e-wallet payment method.', 422);
 
+        try {
+            $frontendUrl = $this->paymongoFrontendUrl();
+        } catch (RuntimeException $error) {
+            $api->respond_error($error->getMessage(), 503);
+        }
+
         $db->transaction();
         $appointment = $db->raw("SELECT a.appointment_id, a.appt_date, a.appt_time, s.service_name, s.price FROM appointments a JOIN patients pt ON pt.patient_id=a.patient_id JOIN services s ON s.service_id=a.service_id WHERE a.appointment_id=? AND pt.user_id=? AND a.status NOT IN ('cancelled','no_show') FOR UPDATE", [$appointmentId, (int) $user['user_id']])->fetch(PDO::FETCH_ASSOC);
         if (!$appointment) { $db->roll_back(); $api->respond_error('Appointment not found or unavailable for payment.', 404); }
@@ -454,12 +507,10 @@ class Clinic_operations extends Controller
         $amount = $paymentPlan === 'downpayment' ? round((float) $appointment['price'] * $paymentPercent / 100, 2) : $balance;
         $amount = min($amount, $balance);
 
-        $receipt = 'TD-' . strtoupper(bin2hex(random_bytes(5)));
-        $db->raw("INSERT INTO payments (appointment_id, payment_method_id, amount, payment_plan, payment_percent, receipt_no, status, paid_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)", [$appointmentId, $methodId, $amount, $paymentPlan, $paymentPercent, $receipt]);
+        $db->raw("INSERT INTO payments (appointment_id, payment_method_id, amount, payment_plan, payment_percent, status, paid_at) VALUES (?, ?, ?, ?, ?, 'pending', NULL)", [$appointmentId, $methodId, $amount, $paymentPlan, $paymentPercent]);
         $paymentId = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
         $db->commit();
 
-        $frontendUrl = rtrim((string) (getenv('FRONTEND_URL') ?: 'http://localhost:5173'), '/');
         $returnUrl = $frontendUrl . '/patient/payment?paymongo=return&payment_id=' . $paymentId;
         $payload = [
             'data' => [
@@ -556,7 +607,9 @@ class Clinic_operations extends Controller
                 [$paymentId]
             )->fetch(PDO::FETCH_ASSOC);
             if (!$paymentDetails) { $db->roll_back(); $api->respond_error('Payment details were not found.', 404); }
-            $db->raw("UPDATE payments SET status='verified', paid_at=NOW() WHERE payment_id=?", [$paymentId]);
+            $receiptNo = $paymentDetails['receipt_no'] ?: 'TD-' . strtoupper(bin2hex(random_bytes(5)));
+            $paymentDetails['receipt_no'] = $receiptNo;
+            $db->raw("UPDATE payments SET status='verified', receipt_no=?, paid_at=NOW() WHERE payment_id=?", [$receiptNo, $paymentId]);
             $this->notifyPaymentInApp($db, (int) $paymentId, 'verified', (int) $user['user_id']);
             medicare_audit($db, (int) $user['user_id'], 'UPDATE', 'payments', (int) $paymentId);
             $db->commit();
@@ -597,7 +650,7 @@ class Clinic_operations extends Controller
     public function myPayments()
     {
         $api = $this->api(); $db = $this->db(); $user = medicare_require_role($db, $api, ['Patient']);
-        $rows = $db->raw('SELECT p.payment_id, p.appointment_id, p.amount, p.payment_plan, p.payment_percent, p.reference_no, p.receipt_no, p.status, p.paid_at, pm.method_name, s.service_name, a.appt_date FROM payments p JOIN appointments a ON a.appointment_id=p.appointment_id JOIN patients pt ON pt.patient_id=a.patient_id JOIN services s ON s.service_id=a.service_id JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id WHERE pt.user_id=? ORDER BY p.payment_id DESC', [(int) $user['user_id']])->fetchAll(PDO::FETCH_ASSOC);
+        $rows = $db->raw("SELECT p.payment_id, p.appointment_id, p.amount, p.payment_plan, p.payment_percent, p.reference_no, CASE WHEN p.status='verified' THEN p.receipt_no ELSE NULL END AS receipt_no, p.status, p.paid_at, pm.method_name, s.service_name, a.appt_date FROM payments p JOIN appointments a ON a.appointment_id=p.appointment_id JOIN patients pt ON pt.patient_id=a.patient_id JOIN services s ON s.service_id=a.service_id JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id WHERE pt.user_id=? ORDER BY p.payment_id DESC", [(int) $user['user_id']])->fetchAll(PDO::FETCH_ASSOC);
         $api->respond(['data' => $rows]);
     }
 
@@ -652,8 +705,9 @@ class Clinic_operations extends Controller
         $paymentPlan = ($body['payment_plan'] ?? 'full') === 'downpayment' ? 'downpayment' : 'full';
         $paymentPercent = $paymentPlan === 'downpayment' ? filter_var($body['payment_percent'] ?? null, FILTER_VALIDATE_INT) : 100;
         if (!$appointmentId || !$methodId || !in_array($paymentPercent, [50, 60, 70, 80, 100], true) || mb_strlen($reference) > 100) $api->respond_error('Choose a valid payment plan and payment method, then enter a valid reference.', 422);
-        $method = $db->raw('SELECT payment_method_id FROM payment_methods WHERE payment_method_id=? AND is_active=1', [$methodId])->fetch(PDO::FETCH_ASSOC);
+        $method = $db->raw('SELECT payment_method_id, type FROM payment_methods WHERE payment_method_id=? AND is_active=1', [$methodId])->fetch(PDO::FETCH_ASSOC);
         if (!$method) $api->respond_error('Payment method not found or inactive.', 404);
+        if (in_array($method['type'], ['ewallet', 'card'], true)) $api->respond_error('Online e-wallet and card payments must be completed through PayMongo Checkout.', 422);
         $db->transaction();
         $appointment = $db->raw("SELECT a.appointment_id, s.price FROM appointments a JOIN patients pt ON pt.patient_id=a.patient_id JOIN services s ON s.service_id=a.service_id WHERE a.appointment_id=? AND pt.user_id=? AND a.status NOT IN ('cancelled','no_show') FOR UPDATE", [$appointmentId, (int) $user['user_id']])->fetch(PDO::FETCH_ASSOC);
         if (!$appointment) { $db->roll_back(); $api->respond_error('Appointment not found or unavailable for payment.', 404); }
@@ -664,7 +718,7 @@ class Clinic_operations extends Controller
         if ($balance <= 0) { $db->roll_back(); $api->respond_error('This appointment is already fully paid.', 409); }
         $amount = $paymentPlan === 'downpayment' ? round((float) $appointment['price'] * $paymentPercent / 100, 2) : $balance;
         $amount = min($amount, $balance);
-        $db->raw('INSERT INTO payments (appointment_id, payment_method_id, amount, payment_plan, payment_percent, reference_no, receipt_no, status, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())', [$appointmentId, $methodId, $amount, $paymentPlan, $paymentPercent, $reference ?: null, 'TD-' . strtoupper(bin2hex(random_bytes(5))), 'pending']);
+        $db->raw("INSERT INTO payments (appointment_id, payment_method_id, amount, payment_plan, payment_percent, reference_no, status, paid_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)", [$appointmentId, $methodId, $amount, $paymentPlan, $paymentPercent, $reference ?: null]);
         $id = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
         $this->notifyPaymentInApp($db, $id, 'submitted', (int) $user['user_id']);
         $db->commit(); medicare_audit($db, (int) $user['user_id'], 'INSERT', 'payments', $id);
@@ -677,13 +731,14 @@ class Clinic_operations extends Controller
         $api = $this->api(); $db = $this->db(); $user = medicare_require_role($db, $api, ['Patient']);
         $row = $db->raw('SELECT p.payment_id, p.receipt_no, p.amount, p.payment_plan, p.payment_percent, p.reference_no, p.status, p.paid_at, pm.method_name, pm.account_name, pm.account_no, a.appt_date, a.appt_time, s.service_name, pt.first_name, pt.last_name FROM payments p JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id JOIN appointments a ON a.appointment_id=p.appointment_id JOIN services s ON s.service_id=a.service_id JOIN patients pt ON pt.patient_id=a.patient_id WHERE p.payment_id=? AND pt.user_id=?', [(int) $id, (int) $user['user_id']])->fetch(PDO::FETCH_ASSOC);
         if (!$row) $api->respond_error('Receipt not found.', 404);
+        if ($row['status'] !== 'verified' || !$row['receipt_no']) $api->respond_error('The official receipt will be available after the clinic confirms payment.', 409);
         $api->respond(['data' => $row]);
     }
 
     public function pendingPayments()
     {
         $api = $this->api(); $db = $this->db(); medicare_require_role($db, $api, ['Staff', 'Admin']);
-        $rows = $db->raw("SELECT p.payment_id, p.appointment_id, p.amount, p.payment_plan, p.payment_percent, s.price AS amount_due, GREATEST(s.price-COALESCE(v.verified_amount,0)-p.amount,0) AS balance_due, p.reference_no, p.receipt_no, p.status, p.paid_at, pm.method_name, s.service_name, a.appt_date, CONCAT(pt.first_name, ' ', pt.last_name) AS patient_name, CASE WHEN p.transaction_id LIKE 'paymongo:%' THEN 'paymongo' ELSE 'clinic' END AS verification_source FROM payments p JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id JOIN appointments a ON a.appointment_id=p.appointment_id JOIN services s ON s.service_id=a.service_id JOIN patients pt ON pt.patient_id=a.patient_id LEFT JOIN (SELECT appointment_id,SUM(amount) AS verified_amount FROM payments WHERE status='verified' GROUP BY appointment_id) v ON v.appointment_id=p.appointment_id WHERE p.status='pending' ORDER BY p.paid_at")->fetchAll(PDO::FETCH_ASSOC);
+        $rows = $db->raw("SELECT p.payment_id, p.appointment_id, p.amount, p.payment_plan, p.payment_percent, s.price AS amount_due, GREATEST(s.price-COALESCE(v.verified_amount,0)-p.amount,0) AS balance_due, p.reference_no, p.receipt_no, p.status, p.paid_at, pm.method_name, s.service_name, a.appt_date, CONCAT(pt.first_name, ' ', pt.last_name) AS patient_name, CASE WHEN p.transaction_id LIKE 'paymongo:%' THEN 'paymongo' ELSE 'clinic' END AS verification_source FROM payments p JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id JOIN appointments a ON a.appointment_id=p.appointment_id JOIN services s ON s.service_id=a.service_id JOIN patients pt ON pt.patient_id=a.patient_id LEFT JOIN (SELECT appointment_id,SUM(amount) AS verified_amount FROM payments WHERE status='verified' GROUP BY appointment_id) v ON v.appointment_id=p.appointment_id WHERE p.status='pending' ORDER BY p.payment_id DESC")->fetchAll(PDO::FETCH_ASSOC);
         $api->respond(['data' => $rows]);
     }
 
@@ -737,9 +792,14 @@ class Clinic_operations extends Controller
         $payment['payment_plan_label'] = $payment['payment_plan'] === 'downpayment'
             ? (int) $payment['payment_percent'] . '% downpayment'
             : 'Full payment';
+        $receiptNo = $payment['receipt_no'] ?? null;
+        if ($status === 'verified' && !$receiptNo) {
+            $receiptNo = 'TD-' . strtoupper(bin2hex(random_bytes(5)));
+        }
+        $payment['receipt_no'] = $receiptNo;
         $db->raw(
-            'UPDATE payments SET status=?, paid_at=CASE WHEN ? = ? THEN COALESCE(paid_at, NOW()) ELSE paid_at END WHERE payment_id=?',
-            [$status, $status, 'verified', (int) $id]
+            'UPDATE payments SET status=?, receipt_no=CASE WHEN ? = ? THEN COALESCE(receipt_no, ?) ELSE receipt_no END, paid_at=CASE WHEN ? = ? THEN COALESCE(paid_at, NOW()) ELSE paid_at END WHERE payment_id=?',
+            [$status, $status, 'verified', $receiptNo, $status, 'verified', (int) $id]
         );
         if ($previousStatus !== $status) {
             $this->notifyPaymentInApp($db, (int) $id, $status, (int) $user['user_id']);
@@ -777,20 +837,59 @@ class Clinic_operations extends Controller
     {
         $api = $this->api(); $db = $this->db(); medicare_require_role($db, $api, ['Staff', 'Admin']);
         $appointmentId = filter_var($_GET['appointment_id'] ?? null, FILTER_VALIDATE_INT);
-        $sql = "SELECT tr.record_id, tr.appointment_id, tr.patient_id, tr.dentist_id, tr.tooth_no, tr.diagnosis, tr.treatment_done, tr.notes, tr.created_at, CONCAT(p.first_name, ' ', p.last_name) AS patient_name FROM treatment_records tr JOIN patients p ON p.patient_id=tr.patient_id";
+        $sql = "SELECT tr.record_id, tr.appointment_id, tr.patient_id, tr.dentist_id, tr.tooth_no, tr.diagnosis, tr.treatment_done, tr.notes, tr.follow_up_date, tr.follow_up_time, tr.created_at, CONCAT(p.first_name, ' ', p.last_name) AS patient_name FROM treatment_records tr JOIN patients p ON p.patient_id=tr.patient_id";
         $rows = $db->raw($sql . ($appointmentId ? ' WHERE tr.appointment_id=?' : '') . ' ORDER BY tr.created_at DESC LIMIT 500', $appointmentId ? [$appointmentId] : [])->fetchAll(PDO::FETCH_ASSOC); $api->respond(['data' => $rows]);
     }
 
     public function addTreatment()
     {
         $api = $this->api(); $api->require_method('POST'); $db = $this->db(); $user = medicare_require_role($db, $api, ['Staff', 'Admin']); $body = $api->body();
-        $appointmentId = filter_var($body['appointment_id'] ?? null, FILTER_VALIDATE_INT); $dentistId = filter_var($body['dentist_id'] ?? null, FILTER_VALIDATE_INT); $tooth = trim((string) ($body['tooth_no'] ?? '')); $diagnosis = trim((string) ($body['diagnosis'] ?? '')); $treatment = trim((string) ($body['treatment_done'] ?? '')); $notes = trim((string) ($body['notes'] ?? ''));
+        $rawFollowUpDate = $body['follow_up_date'] ?? '';
+        $rawFollowUpTime = $body['follow_up_time'] ?? '';
+        if (($rawFollowUpDate !== null && !is_string($rawFollowUpDate)) || ($rawFollowUpTime !== null && !is_string($rawFollowUpTime))) $api->respond_error('Return date and time must be text values.', 422);
+        $appointmentId = filter_var($body['appointment_id'] ?? null, FILTER_VALIDATE_INT); $dentistId = filter_var($body['dentist_id'] ?? null, FILTER_VALIDATE_INT); $tooth = trim((string) ($body['tooth_no'] ?? '')); $diagnosis = trim((string) ($body['diagnosis'] ?? '')); $treatment = trim((string) ($body['treatment_done'] ?? '')); $notes = trim((string) ($body['notes'] ?? '')); $followUpDate = trim((string) ($rawFollowUpDate ?? '')); $followUpTime = trim((string) ($rawFollowUpTime ?? ''));
+        $hasReturnVisit = $followUpDate !== '' || $followUpTime !== '';
+        $validFollowUpDate = $followUpDate !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $followUpDate) && checkdate((int) substr($followUpDate, 5, 2), (int) substr($followUpDate, 8, 2), (int) substr($followUpDate, 0, 4));
+        $validFollowUpTime = preg_match('/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/', $followUpTime);
+        if ($followUpTime !== '' && strlen($followUpTime) === 5) $followUpTime .= ':00';
+        $validFutureReturn = !$hasReturnVisit || ($followUpDate !== '' && $followUpTime !== '' && $validFollowUpDate && $validFollowUpTime && ($followUpDate > date('Y-m-d') || ($followUpDate === date('Y-m-d') && $followUpTime > date('H:i:s'))));
+        if (!$validFutureReturn) $api->respond_error('Set both a valid future return date and time, or leave both fields blank.', 422);
         if (!$appointmentId || !$dentistId || (!$diagnosis && !$treatment) || mb_strlen($diagnosis)>5000 || mb_strlen($treatment)>5000 || mb_strlen($notes)>5000 || ($tooth!=='' && !preg_match('/^(1[1-8]|2[1-8]|3[1-8]|4[1-8])$/',$tooth))) $api->respond_error('Choose an appointment and dentist, enter a diagnosis or treatment, and use a valid FDI tooth number.', 422);
         $appointment = $db->raw('SELECT patient_id,dentist_id FROM appointments WHERE appointment_id=?', [$appointmentId])->fetch(PDO::FETCH_ASSOC); $dentist = $db->raw('SELECT dentist_id FROM dentists WHERE dentist_id=?', [$dentistId])->fetch(PDO::FETCH_ASSOC);
         if (!$appointment || !$dentist) $api->respond_error('Appointment or dentist not found.', 404);
         if ($appointment['dentist_id'] && (int)$appointment['dentist_id'] !== (int)$dentistId) $api->respond_error('Choose the dentist assigned to this appointment.', 422);
-        $db->raw('INSERT INTO treatment_records (appointment_id, patient_id, dentist_id, tooth_no, diagnosis, treatment_done, notes) VALUES (?, ?, ?, ?, ?, ?, ?)', [$appointmentId, $appointment['patient_id'], $dentistId, $tooth ?: null, $diagnosis ?: null, $treatment ?: null, $notes ?: null]);
-        $id = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn(); medicare_audit($db, (int) $user['user_id'], 'INSERT', 'treatment_records', $id); $api->respond(['data' => ['record_id' => $id]], 201);
+
+        $db->transaction();
+        try {
+            $db->raw('INSERT INTO treatment_records (appointment_id, patient_id, dentist_id, tooth_no, diagnosis, treatment_done, notes, follow_up_date, follow_up_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [$appointmentId, $appointment['patient_id'], $dentistId, $tooth ?: null, $diagnosis ?: null, $treatment ?: null, $notes ?: null, $followUpDate ?: null, $followUpTime ?: null]);
+            $id = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
+            $notificationsSent = ['patient' => false, 'dentist' => false];
+
+            if ($hasReturnVisit) {
+                $accounts = $db->raw(
+                    'SELECT p.user_id AS patient_user_id, d.user_id AS dentist_user_id, CONCAT(p.first_name, \' \', p.last_name) AS patient_name FROM patients p LEFT JOIN dentists d ON d.dentist_id=? WHERE p.patient_id=? LIMIT 1',
+                    [$dentistId, (int) $appointment['patient_id']]
+                )->fetch(PDO::FETCH_ASSOC);
+                $returnLabel = (new DateTimeImmutable($followUpDate . ' ' . $followUpTime))->format('F j, Y \a\t g:i A');
+                $notificationModel = $this->call->model('Notification_model');
+
+                if (!empty($accounts['patient_user_id'])) {
+                    $notificationModel->createOnce((int) $accounts['patient_user_id'], (int) $user['user_id'], 'Return visit scheduled', 'Your dentist scheduled a return visit for ' . $returnLabel . '.', 'return_visit', 'patient', '/patient/appointments', 'treatment:' . $id . ':return:patient');
+                    $notificationsSent['patient'] = true;
+                }
+                if (!empty($accounts['dentist_user_id'])) {
+                    $notificationModel->createOnce((int) $accounts['dentist_user_id'], (int) $user['user_id'], 'Patient return visit scheduled', ($accounts['patient_name'] ?: 'A patient') . ' is scheduled to return on ' . $returnLabel . '.', 'return_visit', 'staff', '/staff/appointments', 'treatment:' . $id . ':return:dentist');
+                    $notificationsSent['dentist'] = true;
+                }
+            }
+
+            medicare_audit($db, (int) $user['user_id'], 'INSERT', 'treatment_records', $id);
+            $db->commit();
+        } catch (Throwable $cause) {
+            $db->roll_back();
+            throw $cause;
+        }
+        $api->respond(['data' => ['record_id' => $id, 'return_notifications' => $notificationsSent]], 201);
     }
 
     public function notificationLog()

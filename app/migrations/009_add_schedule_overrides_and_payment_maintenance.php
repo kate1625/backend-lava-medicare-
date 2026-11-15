@@ -29,6 +29,9 @@ class Add_schedule_overrides_and_payment_maintenance
             $db->raw('ALTER TABLE dentist_schedules ADD COLUMN schedule_date DATE NULL AFTER day_of_week');
         }
 
+        $db->raw('ALTER TABLE dentist_schedules MODIFY COLUMN start_time TIME NULL');
+        $db->raw('ALTER TABLE dentist_schedules MODIFY COLUMN end_time TIME NULL');
+
         $availableColumn = (int) $db->raw(
             'SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?',
             ['dentist_schedules', 'is_available']

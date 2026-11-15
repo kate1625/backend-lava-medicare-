@@ -47,7 +47,7 @@ class Appointments extends Controller
         );
     }
 
-    private function notifyPatient($database, int $appointmentId, string $type): void
+    private function notifyPatient($database, int $appointmentId, string $type): array
     {
         $appointment = $database->raw(
             "SELECT a.appointment_id, a.patient_id, a.reschedule_reason, CONCAT(p.first_name, ' ', p.last_name) AS patient_name, "
@@ -56,16 +56,28 @@ class Appointments extends Controller
             . 'JOIN services s ON s.service_id=a.service_id WHERE a.appointment_id=? LIMIT 1',
             [$appointmentId]
         )->fetch(PDO::FETCH_ASSOC);
-        if (!$appointment || !filter_var($appointment['patient_email'] ?? '', FILTER_VALIDATE_EMAIL)) {
-            error_log('MediCare+ appointment notification skipped: appointment or patient email is missing for #' . $appointmentId);
-            return;
+        if (!$appointment) {
+            error_log('MediCare+ appointment notification skipped: appointment not found for #' . $appointmentId);
+            return ['sent' => false, 'error' => 'Appointment not found.'];
         }
 
-        $result = $this->call->library('brevo_mailer')->sendAppointment($appointment, $type);
-        $subject = $type === 'appointment_reminder'
-            ? 'Reminder: your MediCare+ appointment is today'
-            : ($type === 'appointment_created' ? 'MediCare+ appointment request received' : 'Appointment ' . str_replace('_', ' ', (string) $appointment['status']));
+        if (!filter_var($appointment['patient_email'] ?? '', FILTER_VALIDATE_EMAIL)) {
+            $result = ['sent' => false, 'error' => 'The patient profile does not have a valid email address.'];
+        } else {
+            $result = $this->call->library('brevo_mailer')->sendAppointment($appointment, $type);
+        }
+        $subjects = [
+            'appointment_reminder' => 'Reminder: your MediCare+ appointment is today',
+            'appointment_created' => 'MediCare+ appointment request received',
+            'appointment_confirmed' => 'MediCare+ appointment confirmed',
+            'appointment_completed' => 'MediCare+ appointment completed',
+            'appointment_no_show' => 'MediCare+ appointment follow-up',
+            'appointment_rescheduled' => 'MediCare+ appointment rescheduled',
+            'appointment_cancelled' => 'MediCare+ appointment cancelled',
+        ];
+        $subject = $subjects[$type] ?? 'Appointment ' . str_replace('_', ' ', (string) $appointment['status']);
         medicare_log_patient_email($database, $appointmentId, (int) $appointment['patient_id'], $type, $subject, $result);
+        return $result;
     }
 
     private function notifyAdminAppointment($database, int $appointmentId, string $event): void
@@ -131,14 +143,14 @@ class Appointments extends Controller
 
     private function appointmentRows($database, array $user): array
     {
-        $base = "SELECT a.appointment_id, a.patient_id, a.service_id, a.dentist_id, a.appt_date, a.appt_time, a.end_time, a.status, a.remarks, a.cancel_reason, a.reschedule_reason, a.created_at, CONCAT(pt.first_name, ' ', pt.last_name) AS patient, pt.email AS patient_email, s.service_name, s.price, CONCAT(du.username) AS dentist, "
+        $base = "SELECT a.appointment_id, a.patient_id, a.service_id, a.dentist_id, a.appt_date, a.appt_time, a.end_time, a.status, a.remarks, a.cancel_reason, a.reschedule_reason, a.created_at, CONCAT(pt.first_name, ' ', pt.last_name) AS patient, pt.email AS patient_email, s.service_name, s.price, s.duration_min, CONCAT(du.username) AS dentist, "
             . "(SELECT p.payment_id FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_id, "
             . "(SELECT p.status FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_status, "
             . "(SELECT p.amount FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_amount, "
             . "(SELECT pm.method_name FROM payments p JOIN payment_methods pm ON pm.payment_method_id=p.payment_method_id WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_method, "
             . "(SELECT p.reference_no FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_reference, "
             . "(SELECT p.transaction_id FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_transaction, "
-            . "(SELECT p.receipt_no FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS receipt_no "
+            . "(SELECT CASE WHEN p.status='verified' THEN p.receipt_no ELSE NULL END FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS receipt_no "
             . ",(SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.appointment_id=a.appointment_id AND p.status='verified') AS verified_amount "
             . "FROM appointments a JOIN services s ON s.service_id=a.service_id JOIN patients pt ON pt.patient_id=a.patient_id LEFT JOIN dentists d ON d.dentist_id=a.dentist_id LEFT JOIN users du ON du.user_id=d.user_id";
         if ($user['role_name'] === 'Patient') {
@@ -379,7 +391,9 @@ class Appointments extends Controller
         $statement = $database->raw(
             "SELECT a.appointment_id, a.patient_id, a.service_id, a.dentist_id, a.appt_date, a.appt_time,
                     a.end_time, a.status, a.remarks, a.cancel_reason, a.reschedule_reason, a.created_at,
-                    s.service_name, s.price, du.username AS dentist,
+                    s.service_name, s.price, s.duration_min, du.username AS dentist,
+                   (SELECT p.status FROM payments p WHERE p.appointment_id=a.appointment_id ORDER BY p.payment_id DESC LIMIT 1) AS payment_status,
+                   COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.appointment_id=a.appointment_id AND p.status='verified'), 0) AS verified_amount,
                     CONCAT(pt.first_name, ' ', pt.last_name) AS patient, pt.email AS patient_email
              FROM appointments a
              JOIN services s ON s.service_id=a.service_id
@@ -482,7 +496,7 @@ class Appointments extends Controller
             $database->roll_back();
             $api->respond_error('You already have an appointment that overlaps this time. Choose another time.', 409);
         }
-        $status = $user['role_name'] === 'Patient' ? 'pending' : 'confirmed';
+        $status = 'pending';
         $database->raw('INSERT INTO appointments (patient_id, service_id, dentist_id, appt_date, appt_time, end_time, status) VALUES (?, ?, ?, ?, ?, ?, ?)', [(int) $booking['patient_id'], $serviceId, $dentistId, $date, $time, $end, $status]);
         $appointmentId = (int) $database->last_id();
         $eventKey = 'appointment:' . $appointmentId . ':created';
@@ -562,6 +576,17 @@ class Appointments extends Controller
         if (!$exists) { $database->roll_back(); $api->respond_error('Appointment not found.', 404); }
         $transitions = ['pending' => ['confirmed'], 'confirmed' => ['completed', 'no_show']];
         if (!in_array($status, $transitions[$exists['status']] ?? [], true)) { $database->roll_back(); $api->respond_error('This appointment status cannot be changed that way.', 409); }
+        if ($status === 'confirmed' && (float) $exists['verified_amount'] < (float) $exists['price']) {
+            $database->roll_back();
+            $api->respond_error('This appointment cannot be confirmed until the full payment is verified.', 409);
+        }
+        if ($status === 'no_show') {
+            $appointmentEnd = $exists['appt_date'] . ' ' . $exists['appointment_end'];
+            if (strtotime($appointmentEnd) === false || strtotime($appointmentEnd) > time()) {
+                $database->roll_back();
+                $api->respond_error('An appointment can only be marked no-show after its scheduled end time.', 409);
+            }
+        }
         if ($status === 'completed') {
             $appointmentEnd = $exists['appt_date'] . ' ' . $exists['appointment_end'];
             if (strtotime($appointmentEnd) === false || strtotime($appointmentEnd) > time()) {
@@ -574,18 +599,32 @@ class Appointments extends Controller
             }
         }
         $database->raw('UPDATE appointments SET status=? WHERE appointment_id=?', [$status, (int) $id]);
+        $eventKey = 'appointment:' . (int) $id . ':' . $status;
         $this->notifyAppointmentPatient(
             $database,
             (int) $id,
-            'appointment:' . (int) $id . ':' . $status,
+            $eventKey,
             'Appointment ' . str_replace('_', ' ', $status),
             'Your appointment for ' . $exists['service_name'] . ' is now ' . str_replace('_', ' ', $status) . '.',
             (int) $user['user_id']
         );
+        if ($status === 'no_show') {
+            $this->notifyAppointmentTeam(
+                $eventKey,
+                'Patient marked no-show',
+                $exists['patient_name'] . ' was marked no-show for appointment #' . (int) $id . '.',
+                (int) $user['user_id']
+            );
+        }
         $database->commit();
         medicare_audit($database, (int) $user['user_id'], 'UPDATE', 'appointments', (int) $id);
-        $this->notifyPatient($database, (int) $id, 'appointment_status');
-        $api->respond(['data' => ['appointment_id' => (int) $id, 'status' => $status]]);
+        $email = $this->notifyPatient($database, (int) $id, 'appointment_' . $status);
+        $message = 'Appointment marked ' . str_replace('_', ' ', $status) . '.';
+        $message .= $email['sent'] ? ' Patient email sent.' : ' Patient email could not be sent; check the Email & Notification Log.';
+        $api->respond([
+            'data' => ['appointment_id' => (int) $id, 'status' => $status, 'email_sent' => $email['sent']],
+            'message' => $message,
+        ]);
     }
 
     public function reschedule($id)
@@ -603,9 +642,17 @@ class Appointments extends Controller
         if (!$this->slotIsInFuture($date, $time)) $api->respond_error('Choose a time that has not already passed.', 422);
 
         $database->transaction();
-        $appointment = $database->raw('SELECT a.dentist_id, a.service_id, a.status, p.user_id AS patient_user_id, s.service_name FROM appointments a JOIN patients p ON p.patient_id=a.patient_id JOIN services s ON s.service_id=a.service_id WHERE a.appointment_id=? LIMIT 1 FOR UPDATE', [$id])->fetch(PDO::FETCH_ASSOC);
+        $appointment = $database->raw(
+            "SELECT a.dentist_id, a.service_id, a.status, p.user_id AS patient_user_id, s.service_name, s.price,
+                    COALESCE((SELECT SUM(pay.amount) FROM payments pay WHERE pay.appointment_id=a.appointment_id AND pay.status='verified'), 0) AS verified_amount
+             FROM appointments a
+             JOIN patients p ON p.patient_id=a.patient_id
+             JOIN services s ON s.service_id=a.service_id
+             WHERE a.appointment_id=? LIMIT 1 FOR UPDATE",
+            [$id]
+        )->fetch(PDO::FETCH_ASSOC);
         if (!$appointment) { $database->roll_back(); $api->respond_error('Appointment not found.', 404); }
-        if (!$appointment['dentist_id'] || !in_array($appointment['status'], ['pending','confirmed'], true)) { $database->roll_back(); $api->respond_error('This appointment cannot be rescheduled.', 409); }
+        if (!$appointment['dentist_id'] || $appointment['status'] !== 'no_show') { $database->roll_back(); $api->respond_error('Only a no-show appointment can be rescheduled.', 409); }
         $service = $database->raw('SELECT duration_min FROM services WHERE service_id=?', [(int) $appointment['service_id']])->fetch(PDO::FETCH_ASSOC);
         $duration = max(15, (int) ($service['duration_min'] ?? 30));
         $this->lockSchedulesForDate($database, (int) $appointment['dentist_id'], $date);
@@ -614,12 +661,30 @@ class Appointments extends Controller
             $api->respond_error('That appointment slot is no longer available.', 409);
         }
         $end = (new DateTimeImmutable($date . ' ' . $time))->modify('+' . $duration . ' minutes')->format('H:i:s');
-        $database->raw('UPDATE appointments SET appt_date=?, appt_time=?, end_time=?, reschedule_reason=? WHERE appointment_id=?', [$date, $time, $end, $reason, $id]);
+        $status = (float) $appointment['verified_amount'] >= (float) $appointment['price'] ? 'confirmed' : 'pending';
+        $database->raw('UPDATE appointments SET appt_date=?, appt_time=?, end_time=?, reschedule_reason=?, status=? WHERE appointment_id=?', [$date, $time, $end, $reason, $status, $id]);
         $eventKey = 'appointment:' . $id . ':rescheduled:' . $date . 'T' . substr($time, 0, 5);
-        $this->notifyAppointmentPatient($database, $id, $eventKey, 'Appointment rescheduled', 'Your ' . $appointment['service_name'] . ' appointment has been rescheduled to ' . $date . ' at ' . substr($time, 0, 5) . '.', (int) $user['user_id']);
+        $patientMessage = 'Your ' . $appointment['service_name'] . ' appointment has been rescheduled to ' . $date . ' at ' . substr($time, 0, 5) . '.';
+        if ($status === 'pending') {
+            $patientMessage .= ' Full payment must be verified before the appointment is confirmed.';
+        }
+        $this->notifyAppointmentPatient($database, $id, $eventKey, 'Appointment rescheduled', $patientMessage, (int) $user['user_id']);
+        $this->notifyAppointmentTeam(
+            $eventKey,
+            'No-show appointment rescheduled',
+            'Appointment #' . $id . ' has been rescheduled to ' . $date . ' at ' . substr($time, 0, 5) . '.',
+            (int) $user['user_id']
+        );
         $database->commit();
         medicare_audit($database, (int) $user['user_id'], 'UPDATE', 'appointments', $id);
-        $this->notifyPatient($database, $id, 'appointment_rescheduled');
-        $api->respond(['data' => ['appointment_id' => $id, 'appt_date' => $date, 'appt_time' => $time]]);
+        $email = $this->notifyPatient($database, $id, 'appointment_rescheduled');
+        $message = $status === 'confirmed'
+            ? 'Appointment rescheduled and confirmed.'
+            : 'Appointment rescheduled; full payment must be verified before confirming.';
+        $message .= $email['sent'] ? ' Patient email sent.' : ' Patient email could not be sent; check the Email & Notification Log.';
+        $api->respond([
+            'data' => ['appointment_id' => $id, 'appt_date' => $date, 'appt_time' => $time, 'status' => $status, 'email_sent' => $email['sent']],
+            'message' => $message,
+        ]);
     }
 }

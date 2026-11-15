@@ -90,15 +90,39 @@ class Brevo_mailer
         $time = htmlspecialchars(substr((string) $appointment['appt_time'], 0, 5), ENT_QUOTES, 'UTF-8');
         $status = str_replace('_', ' ', (string) $appointment['status']);
         $rescheduleReason = htmlspecialchars((string) ($appointment['reschedule_reason'] ?? ''), ENT_QUOTES, 'UTF-8');
-        $subject = $type === 'appointment_reminder'
-            ? 'Reminder: your MediCare+ appointment is today'
-            : ($type === 'appointment_created' ? 'MediCare+ appointment request received' : 'MediCare+ appointment ' . $status);
-        $heading = $type === 'appointment_reminder'
-            ? 'Your appointment is today'
-            : ($type === 'appointment_created' ? 'We received your appointment request' : 'Appointment update');
+        $subjects = [
+            'appointment_reminder' => 'Reminder: your MediCare+ appointment is today',
+            'appointment_created' => 'MediCare+ appointment request received',
+            'appointment_confirmed' => 'MediCare+ appointment confirmed',
+            'appointment_completed' => 'MediCare+ appointment completed',
+            'appointment_no_show' => 'MediCare+ appointment follow-up',
+            'appointment_rescheduled' => 'MediCare+ appointment rescheduled',
+            'appointment_cancelled' => 'MediCare+ appointment cancelled',
+        ];
+        $headings = [
+            'appointment_reminder' => 'Your appointment is today',
+            'appointment_created' => 'We received your appointment request',
+            'appointment_confirmed' => 'Your appointment is confirmed',
+            'appointment_completed' => 'Your appointment is complete',
+            'appointment_no_show' => 'Appointment follow-up needed',
+            'appointment_rescheduled' => 'Your appointment has been rescheduled',
+            'appointment_cancelled' => 'Your appointment has been cancelled',
+        ];
+        $subject = $subjects[$type] ?? 'MediCare+ appointment ' . $status;
+        $heading = $headings[$type] ?? 'Appointment update';
+        $message = match ($type) {
+            'appointment_confirmed' => 'Your payment has been verified and your appointment is confirmed.',
+            'appointment_completed' => 'Your appointment has been marked complete. Thank you for visiting MediCare+.',
+            'appointment_no_show' => 'The clinic marked this appointment as no-show. Please contact the clinic to arrange another date.',
+            'appointment_rescheduled' => $appointment['status'] === 'pending'
+                ? 'Your appointment has a new date and time, but full payment must be verified before it is confirmed.'
+                : 'The clinic has arranged a new date and time for your appointment.',
+            'appointment_cancelled' => 'This appointment has been cancelled. Please contact the clinic if you have questions.',
+            default => 'Your MediCare+ appointment details:',
+        };
         $html = '<!doctype html><html><body style="font-family:Arial,sans-serif;color:#203238">'
             . '<h2>' . $heading . '</h2><p>Hello ' . $patientName . ',</p>'
-            . '<p>Your MediCare+ appointment details:</p><ul>'
+            . '<p>' . htmlspecialchars($message, ENT_QUOTES, 'UTF-8') . '</p><ul>'
             . '<li><strong>Service:</strong> ' . $serviceName . '</li>'
             . '<li><strong>Date:</strong> ' . $date . '</li>'
             . '<li><strong>Time:</strong> ' . $time . '</li>'
