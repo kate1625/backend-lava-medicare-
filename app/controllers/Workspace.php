@@ -54,7 +54,7 @@ class Workspace extends Controller
     {
         [$api,$db,$user]=$this->ctx(['Staff','Admin','Patient']); $uid=(int)$user['user_id'];
         if($_SERVER['REQUEST_METHOD']==='GET'){
-            $rows=$db->raw('SELECT m.message_id,m.sender_id,m.recipient_id,m.body,m.is_read,m.created_at,s.username sender,r.username recipient FROM clinic_messages m JOIN users s ON s.user_id=m.sender_id JOIN users r ON r.user_id=m.recipient_id WHERE m.sender_id=? OR m.recipient_id=? ORDER BY m.created_at DESC LIMIT 300',[$uid,$uid])->fetchAll(PDO::FETCH_ASSOC);
+            $rows=$db->raw('SELECT m.message_id,m.sender_id,m.recipient_id,m.body,m.is_read,m.created_at,m.reply_to_message_id,s.username sender,r.username recipient,replied.body reply_to_body,replied_sender.username reply_to_sender FROM clinic_messages m JOIN users s ON s.user_id=m.sender_id JOIN users r ON r.user_id=m.recipient_id LEFT JOIN clinic_messages replied ON replied.message_id=m.reply_to_message_id AND ((replied.sender_id=m.sender_id AND replied.recipient_id=m.recipient_id) OR (replied.sender_id=m.recipient_id AND replied.recipient_id=m.sender_id)) LEFT JOIN users replied_sender ON replied_sender.user_id=replied.sender_id WHERE m.sender_id=? OR m.recipient_id=? ORDER BY m.created_at DESC LIMIT 300',[$uid,$uid])->fetchAll(PDO::FETCH_ASSOC);
             $contactSql="SELECT user_id,username,role_name,CASE WHEN last_seen_at >= DATE_SUB(NOW(), INTERVAL 75 SECOND) THEN 1 ELSE 0 END AS is_online FROM users JOIN roles USING(role_id) WHERE user_id<>? AND status='active'";
             if($user['role_name']==='Patient')$contactSql.=" AND role_name IN ('Staff','Admin')";
             $contacts=$db->raw($contactSql.' ORDER BY username',[$uid])->fetchAll(PDO::FETCH_ASSOC); $api->respond(['data'=>['messages'=>$rows,'contacts'=>$contacts]]);
@@ -63,7 +63,15 @@ class Workspace extends Controller
         if(!$to||$body===''||mb_strlen($body)>5000)$api->respond_error('Choose a recipient and enter a message (up to 5000 characters).',422);
         $exists=$db->raw("SELECT u.user_id,r.role_name FROM users u JOIN roles r ON r.role_id=u.role_id WHERE u.user_id=? AND u.status='active'",[$to])->fetch(PDO::FETCH_ASSOC);if(!$exists)$api->respond_error('Recipient not found.',404);
         if($user['role_name']==='Patient'&&!in_array($exists['role_name'],['Staff','Admin'],true))$api->respond_error('Patients may only contact clinic staff.',403);
-        $db->raw('INSERT INTO clinic_messages(sender_id,recipient_id,body) VALUES(?,?,?)',[$uid,$to,$body]);$id=(int)$db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();medicare_audit($db,$uid,'INSERT','clinic_messages',$id);$api->respond(['data'=>['message_id'=>$id]],201);
+        $replyValue=$b['reply_to_message_id']??null;$replyTo=null;
+        if($replyValue!==null&&$replyValue!==''){
+            $validatedReply=filter_var($replyValue,FILTER_VALIDATE_INT);
+            if(!$validatedReply||$validatedReply<1)$api->respond_error('Choose a valid message to reply to.',422);
+            $quotedMessage=$db->raw('SELECT message_id FROM clinic_messages WHERE message_id=? AND ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?))',[(int)$validatedReply,$uid,(int)$to,(int)$to,$uid])->fetch(PDO::FETCH_ASSOC);
+            if(!$quotedMessage)$api->respond_error('You can only reply to a message in this conversation.',422);
+            $replyTo=(int)$validatedReply;
+        }
+        $db->raw('INSERT INTO clinic_messages(sender_id,recipient_id,body,reply_to_message_id) VALUES(?,?,?,?)',[$uid,$to,$body,$replyTo]);$id=(int)$db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();medicare_audit($db,$uid,'INSERT','clinic_messages',$id);$api->respond(['data'=>['message_id'=>$id]],201);
     }
 
     public function unreadMessages()
