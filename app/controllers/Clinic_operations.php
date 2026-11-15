@@ -848,17 +848,123 @@ class Clinic_operations extends Controller
 
     public function dentists()
     {
-        $api=$this->api(); $db=$this->db(); medicare_require_role($db,$api,['Staff','Admin']); $rows=$db->raw('SELECT d.dentist_id,d.specialization,d.license_no,u.username,u.email,s.schedule_id,s.day_of_week,s.start_time,s.end_time FROM dentists d JOIN users u ON u.user_id=d.user_id LEFT JOIN dentist_schedules s ON s.dentist_id=d.dentist_id ORDER BY u.username,s.day_of_week,s.start_time')->fetchAll(PDO::FETCH_ASSOC); $api->respond(['data'=>$rows]);
+        $api = $this->api();
+        $db = $this->db();
+        medicare_require_role($db, $api, ['Staff', 'Admin']);
+        $rows = $db->raw(
+            'SELECT d.dentist_id,d.specialization,d.license_no,u.username,u.email,
+                    s.schedule_id,s.day_of_week,s.schedule_date,s.start_time,s.end_time,s.is_available
+             FROM dentists d
+             JOIN users u ON u.user_id=d.user_id
+             LEFT JOIN dentist_schedules s ON s.dentist_id=d.dentist_id
+             ORDER BY u.username,s.schedule_date,s.day_of_week,s.start_time'
+        )->fetchAll(PDO::FETCH_ASSOC);
+        $api->respond(['data' => $rows]);
     }
 
     public function saveSchedule()
     {
-        $api=$this->api(); $api->require_method('POST'); $db=$this->db(); $user=medicare_require_role($db,$api,['Admin']); $body=$api->body(); $dentist=filter_var($body['dentist_id']??null,FILTER_VALIDATE_INT); $day=filter_var($body['day_of_week']??null,FILTER_VALIDATE_INT); $start=$body['start_time']??''; $end=$body['end_time']??'';
-        if (!$dentist || $day===false || $day<0 || $day>6 || !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/',$start) || !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/',$end) || $start >= $end) $api->respond_error('Enter a dentist, weekday 0–6, and valid ordered start/end times.',422);
-        $exists=$db->raw('SELECT dentist_id FROM dentists WHERE dentist_id=?',[$dentist])->fetch(PDO::FETCH_ASSOC); if(!$exists)$api->respond_error('Dentist not found.',404);
-        $overlap=$db->raw('SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? AND start_time<? AND end_time>? LIMIT 1',[$dentist,$day,$end,$start])->fetch(PDO::FETCH_ASSOC);
-        if($overlap)$api->respond_error('This schedule overlaps an existing availability window.',409);
-        $db->raw('INSERT INTO dentist_schedules (dentist_id,day_of_week,start_time,end_time) VALUES (?,?,?,?)',[$dentist,$day,$start,$end]); $id=(int)$db->raw('SELECT LAST_INSERT_ID()')->fetchColumn(); medicare_audit($db,(int)$user['user_id'],'INSERT','dentist_schedules',$id); $api->respond(['data'=>['schedule_id'=>$id]]);
+        $api = $this->api();
+        $api->require_method('POST');
+        $db = $this->db();
+        $user = medicare_require_role($db, $api, ['Admin']);
+        $body = $api->body();
+        $dentist = filter_var($body['dentist_id'] ?? null, FILTER_VALIDATE_INT);
+        if (!$dentist) {
+            $api->respond_error('Choose a dentist.', 422);
+        }
+
+        $exists = $db->raw('SELECT dentist_id FROM dentists WHERE dentist_id=?', [$dentist])->fetch(PDO::FETCH_ASSOC);
+        if (!$exists) {
+            $api->respond_error('Dentist not found.', 404);
+        }
+
+        $scheduleDate = trim((string) ($body['schedule_date'] ?? ''));
+        $start = trim((string) ($body['start_time'] ?? ''));
+        $end = trim((string) ($body['end_time'] ?? ''));
+        $timePattern = '/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/';
+
+        if ($scheduleDate !== '') {
+            $date = DateTimeImmutable::createFromFormat('!Y-m-d', $scheduleDate);
+            $dateErrors = DateTimeImmutable::getLastErrors();
+            if (
+                !$date
+                || $date->format('Y-m-d') !== $scheduleDate
+                || ($dateErrors !== false && ($dateErrors['warning_count'] > 0 || $dateErrors['error_count'] > 0))
+            ) {
+                $api->respond_error('Choose a valid date for this availability change.', 422);
+            }
+
+            $available = $body['is_available'] ?? null;
+            if (!is_bool($available)) {
+                $api->respond_error('Choose whether the dentist is available on this date.', 422);
+            }
+
+            if ($available) {
+                if (!preg_match($timePattern, $start) || !preg_match($timePattern, $end)) {
+                    $api->respond_error('Enter valid start and end times for this date.', 422);
+                }
+                $startForComparison = strlen($start) === 5 ? $start . ':00' : $start;
+                $endForComparison = strlen($end) === 5 ? $end . ':00' : $end;
+                if ($startForComparison >= $endForComparison) {
+                    $api->respond_error('The end time must be later than the start time.', 422);
+                }
+            } else {
+                $start = null;
+                $end = null;
+            }
+
+            $existing = $db->raw(
+                'SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND schedule_date=? LIMIT 1',
+                [$dentist, $scheduleDate]
+            )->fetch(PDO::FETCH_ASSOC);
+            if ($existing) {
+                $id = (int) $existing['schedule_id'];
+                $db->raw(
+                    'UPDATE dentist_schedules SET day_of_week=NULL,start_time=?,end_time=?,is_available=? WHERE schedule_id=?',
+                    [$start, $end, $available ? 1 : 0, $id]
+                );
+                $action = 'UPDATE';
+            } else {
+                $db->raw(
+                    'INSERT INTO dentist_schedules (dentist_id,day_of_week,schedule_date,start_time,end_time,is_available) VALUES (?,NULL,?,?,?,?)',
+                    [$dentist, $scheduleDate, $start, $end, $available ? 1 : 0]
+                );
+                $id = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
+                $action = 'INSERT';
+            }
+
+            medicare_audit($db, (int) $user['user_id'], $action, 'dentist_schedules', $id);
+            $api->respond(['data' => ['schedule_id' => $id]]);
+        }
+
+        $day = filter_var($body['day_of_week'] ?? null, FILTER_VALIDATE_INT);
+        if (
+            $day === false
+            || $day < 0
+            || $day > 6
+            || !preg_match($timePattern, $start)
+            || !preg_match($timePattern, $end)
+            || $start >= $end
+        ) {
+            $api->respond_error('Enter a weekday from 0 to 6 and valid ordered start/end times.', 422);
+        }
+
+        $overlap = $db->raw(
+            'SELECT schedule_id FROM dentist_schedules WHERE dentist_id=? AND day_of_week=? AND schedule_date IS NULL AND start_time<? AND end_time>? LIMIT 1',
+            [$dentist, $day, $end, $start]
+        )->fetch(PDO::FETCH_ASSOC);
+        if ($overlap) {
+            $api->respond_error('This schedule overlaps an existing availability window.', 409);
+        }
+
+        $db->raw(
+            'INSERT INTO dentist_schedules (dentist_id,day_of_week,schedule_date,start_time,end_time,is_available) VALUES (?,?,NULL,?,?,TRUE)',
+            [$dentist, $day, $start, $end]
+        );
+        $id = (int) $db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
+        medicare_audit($db, (int) $user['user_id'], 'INSERT', 'dentist_schedules', $id);
+        $api->respond(['data' => ['schedule_id' => $id]]);
     }
 
     public function deleteSchedule($id)

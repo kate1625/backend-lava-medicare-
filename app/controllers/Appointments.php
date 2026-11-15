@@ -185,7 +185,10 @@ class Appointments extends Controller
             while ($start->modify('+' . $duration . ' minutes') <= $close) {
                 $end = $start->modify('+' . $duration . ' minutes');
                 if ($this->overlapsLunchBreak($start, $end)) {
-                    $start = $start->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
+                $lunchEnd = new DateTimeImmutable($date . ' ' . self::LUNCH_END);
+                $start = $start < $lunchEnd
+                    ? $lunchEnd
+                    : $start->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
                     continue;
                 }
                 $busy = false;
@@ -217,13 +220,23 @@ class Appointments extends Controller
         foreach ($this->schedulesForDate($database, $dentistId, $date, true) as $schedule) {
             $scheduleStart = new DateTimeImmutable($date . ' ' . $schedule['start_time']);
             $scheduleEnd = new DateTimeImmutable($date . ' ' . $schedule['end_time']);
-            for ($slot = $scheduleStart; $slot <= $startAt; $slot = $slot->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes')) {
+            for ($slot = $scheduleStart; $slot <= $startAt;) {
                 if ($slot == $startAt) {
                     if ($endAt <= $scheduleEnd && !$this->overlapsLunchBreak($startAt, $endAt)) {
                         $insideSchedule = true;
                         break 2;
                     }
                     break;
+                }
+
+                $slotEnd = $slot->modify('+' . $duration . ' minutes');
+                if ($this->overlapsLunchBreak($slot, $slotEnd)) {
+                    $lunchEnd = new DateTimeImmutable($date . ' ' . self::LUNCH_END);
+                    $slot = $slot < $lunchEnd
+                        ? $lunchEnd
+                        : $slot->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
+                } else {
+                    $slot = $slot->modify('+' . self::SLOT_INTERVAL_MINUTES . ' minutes');
                 }
             }
         }
