@@ -285,6 +285,7 @@ class Clinic_operations extends Controller
         $configuredHost = strtolower((string) ($configuredParts['host'] ?? ''));
         $configuredIsLocal = in_array($configuredHost, ['localhost', '127.0.0.1', '::1', '[::1]'], true);
 
+        $configuredUrlIsValid = false;
         if ($configuredUrl !== '' && !($requiresHttps && $configuredIsLocal)) {
             $scheme = strtolower((string) ($configuredParts['scheme'] ?? ''));
             if (!is_array($configuredParts) || !in_array($scheme, ['http', 'https'], true) || !$configuredHost || isset($configuredParts['user']) || isset($configuredParts['pass']) || isset($configuredParts['query']) || isset($configuredParts['fragment'])) {
@@ -293,7 +294,7 @@ class Clinic_operations extends Controller
             if ($requiresHttps && $scheme !== 'https') {
                 throw new RuntimeException('FRONTEND_URL must use HTTPS outside local development.');
             }
-            return $configuredUrl;
+            $configuredUrlIsValid = true;
         }
 
         $requestOrigin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
@@ -313,6 +314,10 @@ class Clinic_operations extends Controller
                 throw new RuntimeException('The allowed PayMongo return origin must use HTTPS outside local development.');
             }
             return $requestOrigin;
+        }
+
+        if ($configuredUrlIsValid) {
+            return $configuredUrl;
         }
 
         if (!$isLocalDevelopment) {
