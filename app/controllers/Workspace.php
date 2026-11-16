@@ -104,11 +104,14 @@ class Workspace extends Controller
     {
         [$api,$db,$user]=$this->ctx(['Staff','Admin','Patient']);
         $api->require_method('POST');
+        $body=$api->body();
+        $senderId=filter_var($body['sender_id']??null,FILTER_VALIDATE_INT);
+        if(!$senderId||(int)$senderId===(int)$user['user_id'])$api->respond_error('Choose a valid conversation to mark as read.',422);
         $db->raw(
-            'UPDATE clinic_messages SET is_read=1 WHERE recipient_id=? AND is_read=0',
-            [(int)$user['user_id']]
+            'UPDATE clinic_messages SET is_read=1 WHERE recipient_id=? AND sender_id=? AND is_read=0',
+            [(int)$user['user_id'],(int)$senderId]
         );
-        $api->respond(['message'=>'Messages marked as read.']);
+        $api->respond(['message'=>'Conversation marked as read.']);
     }
 
     public function settings()
